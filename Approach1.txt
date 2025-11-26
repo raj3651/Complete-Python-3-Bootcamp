@@ -1,1558 +1,333 @@
-package com.example;
 
-/*
- * ═══════════════════════════════════════════════════════════════════════════════
- * IMPORTS SECTION - External libraries and classes needed by this program
- * ═══════════════════════════════════════════════════════════════════════════════
- */
+@RestController
+@RequestMapping("/api/v1/files")
+@RequiredArgsConstructor
+@Slf4j
+public class SecureChunkedDownloadController {
 
-// AWS SDK 2.0 - Credentials Provider
-import software.amazon.awssdk.auth.credentials.DefaultCredentialsProvider;
-// Purpose: Automatically finds AWS credentials from multiple sources:
-// 1. Environment variables: AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY
-// 2. Java system properties: aws.accessKeyId and aws.secretAccessKey
-// 3. Credentials file: ~/.aws/credentials (Linux/Mac) or C:\Users\USERNAME\.aws\credentials (Windows)
-// 4. EC2 instance metadata: If running on EC2, uses IAM role credentials
-// 5. ECS container credentials: If running in ECS, uses task role credentials
+    // AWS S3 client (v2 SDK) — handles SSE-S3, SSE-KMS, CSE-KMS transparently
+    private final S3Client s3;
 
-// AWS SDK 2.0 - Region
-import software.amazon.awssdk.regions.Region;
-// Purpose: Represents AWS regions (geographic locations of data centers)
-// Examples: us-east-1 (Virginia), eu-west-1 (Ireland), ap-southeast-1 (Singapore)
-// WHY IT MATTERS: Connecting to the same region as your bucket reduces latency
+    // Your encrypted bucket name (SSE-S3 or SSE-KMS enabled)
+    private final String bucket = "your-encrypted-research-bucket";
 
-// AWS SDK 2.0 - S3 Client
-import software.amazon.awssdk.services.s3.S3Client;
-// Purpose: Main client for interacting with S3 API
-// Operations: HeadObject (get metadata), GetObject (download), PutObject (upload), etc.
-// This is the "control plane" - we use it to get information, not transfer large data
+    // Max 10 MB per chunk — exactly matches API Gateway REST API hard limit
+    private static final long CHUNK_SIZE = 10_485_760L; // 10 * 1024 * 1024
 
-// AWS SDK 2.0 - S3 Models (Request/Response objects)
-import software.amazon.awssdk.services.s3.model.*;
-// Contains all S3 request and response classes:
-// - HeadObjectRequest: Request to get object metadata
-// - HeadObjectResponse: Contains metadata (size, content-type, etag, last-modified)
-// - GetObjectRequest: Request to download object
-// - NoSuchKeyException: Thrown when object doesn't exist
+    // Thread-safe SHA-256 digest for checksum calculation
+    private static final MessageDigest SHA256;
 
-// AWS SDK 2.0 - S3 Presigner
-import software.amazon.awssdk.services.s3.presigner.S3Presigner;
-// Purpose: Generate presigned URLs - temporary URLs that allow access without credentials
-// HOW IT WORKS:
-// 1. Server has AWS credentials and S3 permissions
-// 2. Server generates URL with cryptographic signature embedded
-// 3. Client uses URL to access S3 directly (no server proxy)
-// 4. URL expires after configured time (e.g., 1 hour)
-// BENEFITS: Server doesn't handle file bytes (saves bandwidth, prevents timeouts)
-
-// AWS SDK 2.0 - Presigner Models
-import software.amazon.awssdk.services.s3.presigner.model.*;
-// Contains presigning-related classes:
-// - GetObjectPresignRequest: Configure presigned URL generation
-// - PresignedGetObjectRequest: The generated URL and its metadata
-
-// Java I/O - Input/Output operations
-import java.io.*;
-// Classes for reading/writing data:
-// - InputStream: Abstract class for reading bytes (we read from network)
-// - OutputStream: Abstract class for writing bytes (we write to file)
-// - RandomAccessFile: Read/write file at any position (not sequential)
-// - ByteArrayOutputStream: In-memory byte buffer (faster than direct disk writes)
-
-// Java Networking
-import java.net.*;
-// Classes for network communication:
-// - URL: Represents a web address (we use presigned S3 URLs)
-// - HttpURLConnection: Make HTTP requests (GET with Range headers)
-// - URLConnection: Base class for network connections
-
-// Java NIO (New I/O) - Modern file operations
-import java.nio.file.*;
-// Modern file system API (better than old java.io.File):
-// - Path: Cross-platform file path representation
-// - Files: Static utility methods for file operations
-// - Paths: Factory for creating Path objects
-
-// Java Time API - Date and time operations
-import java.time.*;
-// Classes for working with time:
-// - Instant: A point in time (e.g., download start time)
-// - Duration: Time span between two instants (e.g., download duration)
-// WHY WE USE IT: Calculate download speed and duration
-
-// Java Collections - Data structures
-import java.util.*;
-// Common data structures:
-// - List: Ordered collection of elements
-// - ArrayList: Resizable array implementation of List
-// - Map, Set, Queue: Other collection types
-
-// Java Concurrency - Multi-threading support
-import java.util.concurrent.*;
-// Classes for parallel execution:
-// - ExecutorService: Manages a pool of threads
-// - Executors: Factory for creating thread pools
-// - Future: Represents result of asynchronous computation
-// - Callable: Task that returns a result (vs Runnable which returns void)
-// - TimeUnit: Time units (SECONDS, MILLISECONDS, etc.)
-// WHY WE USE IT: Download multiple chunks simultaneously
-
-// Java Atomic - Thread-safe variables
-import java.util.concurrent.atomic.*;
-// Thread-safe variables for concurrent access:
-// - AtomicLong: Thread-safe long counter
-// - AtomicInteger: Thread-safe integer counter
-// WHY WE USE IT: Track total downloaded bytes from multiple threads safely
-
-/**
- * ═══════════════════════════════════════════════════════════════════════════════
- * ULTRA-FAST S3 PARALLEL DOWNLOADER - TWO APPROACHES
- * ═══════════════════════════════════════════════════════════════════════════════
- * 
- * WHAT THIS PROGRAM DOES:
- * Downloads files from Amazon S3 5-10x faster using two different approaches:
- * 1. SDK Direct: Uses AWS SDK with credentials (proxied through your server)
- * 2. Presigned URL: Uses temporary URLs (client downloads directly from S3)
- * 
- * ═══════════════════════════════════════════════════════════════════════════════
- * APPROACH 1: SDK DIRECT (WITH CREDENTIALS)
- * ═══════════════════════════════════════════════════════════════════════════════
- * 
- * DATA FLOW:
- * ┌──────────┐      ┌────────────────────────┐      ┌─────┐
- * │  Client  │ ───> │ Your Server (SDK code) │ ───> │ S3  │
- * │          │ <─── │   - Has credentials    │ <─── │     │
- * └──────────┘      │   - Downloads chunks   │      └─────┘
- *                   │   - Returns to client  │
- *                   └────────────────────────────┘
- * 
- * HOW IT WORKS:
- * 1. Your server uses AWS credentials to authenticate with S3
- * 2. Server downloads file chunks using GetObjectRequest with Range parameter
- * 3. Server streams downloaded data back to client
- * 4. Client receives file (file IS downloaded to client, just proxied)
- * 
- * WHEN USED VIA REST ENDPOINT:
- * ```java
- * // Spring Boot Example
- * @GetMapping("/download/{bucket}/{key}")
- * public ResponseEntity<StreamingResponseBody> downloadFile(
- *         @PathVariable String bucket,
- *         @PathVariable String key) {
- *     
- *     StreamingResponseBody stream = outputStream -> {
- *         S3Client s3 = S3Client.builder()
- *             .credentialsProvider(DefaultCredentialsProvider.create())
- *             .region(Region.US_EAST_1)
- *             .build();
- *         
- *         // Download chunk from S3
- *         GetObjectRequest request = GetObjectRequest.builder()
- *             .bucket(bucket)
- *             .key(key)
- *             .range("bytes=0-10485759")  // First 10 MB
- *             .build();
- *         
- *         ResponseInputStream<GetObjectResponse> s3Response = s3.getObject(request);
- *         
- *         // Stream to client
- *         byte[] buffer = new byte[16384];
- *         int bytesRead;
- *         while ((bytesRead = s3Response.read(buffer)) != -1) {
- *             outputStream.write(buffer, 0, bytesRead);  // ← Sends to client
- *         }
- *     };
- *     
- *     return ResponseEntity.ok()
- *         .contentType(MediaType.APPLICATION_OCTET_STREAM)
- *         .body(stream);
- * }
- * ```
- * 
- * CLIENT EXPERIENCE:
- * - Client makes GET request: `GET /api/download/my-bucket/video.mp4`
- * - Server authenticates client (JWT, API key, etc.)
- * - Server downloads from S3 using credentials
- * - Server streams bytes to client in HTTP response body
- * - Client receives file as normal HTTP download
- * - File IS downloaded to client (just goes through server)
- * 
- * SECURITY:
- * ✅ Full authentication on every request
- * ✅ Client never sees AWS credentials
- * ✅ Can enforce complex business logic
- * ✅ Complete audit trail
- * ⚠️  Server must proxy all traffic (bandwidth cost)
- * ⚠️  Server needs AWS credentials (security risk if compromised)
- * 
- * ═══════════════════════════════════════════════════════════════════════════════
- * APPROACH 2: PRESIGNED URL (NO CREDENTIALS ON CLIENT)
- * ═══════════════════════════════════════════════════════════════════════════════
- * 
- * DATA FLOW:
- * ┌──────────┐      ┌─────────────────────┐
- * │  Client  │ ───> │ Your Server         │ (Step 1: Generate URL)
- * │          │ <─── │ (Generates URL)     │
- * └──────────┘      └─────────────────────┘
- *      │
- *      └──────────> ┌─────┐  (Step 2: Download directly)
- *                   │ S3  │
- *           <────── └─────┘
- * 
- * HOW IT WORKS:
- * 1. Client requests download from your server
- * 2. Server generates presigned URL with embedded signature
- * 3. Server returns URL to client (JSON response)
- * 4. Client uses URL to download directly from S3 (bypasses your server)
- * 5. File downloaded directly from S3 to client (no proxy)
- * 
- * WHEN USED VIA REST ENDPOINT:
- * ```java
- * // Spring Boot Example
- * @PostMapping("/generate-download-url")
- * public ResponseEntity<Map<String, String>> generateDownloadUrl(
- *         @RequestBody DownloadRequest request) {
- *     
- *     // Authenticate user
- *     if (!isAuthorized(request.getUserId(), request.getFile())) {
- *         return ResponseEntity.status(403).build();
- *     }
- *     
- *     // Generate presigned URL
- *     S3Presigner presigner = S3Presigner.create();
- *     GetObjectPresignRequest presignRequest = GetObjectPresignRequest.builder()
- *         .signatureDuration(Duration.ofHours(1))
- *         .getObjectRequest(GetObjectRequest.builder()
- *             .bucket(request.getBucket())
- *             .key(request.getKey())
- *             .build())
- *         .build();
- *     
- *     String url = presigner.presignGetObject(presignRequest).url().toString();
- *     
- *     // Return URL to client
- *     return ResponseEntity.ok(Map.of(
- *         "url", url,
- *         "expiresIn", "3600"
- *     ));
- * }
- * ```
- * 
- * CLIENT EXPERIENCE:
- * ```javascript
- * // Step 1: Get presigned URL from your server
- * const response = await fetch('/api/generate-download-url', {
- *     method: 'POST',
- *     headers: { 'Authorization': 'Bearer ' + token },
- *     body: JSON.stringify({ file: 'video.mp4' })
- * });
- * const { url } = await response.json();
- * 
- * // Step 2: Download directly from S3 using URL
- * const fileResponse = await fetch(url);  // No auth needed - signature in URL
- * const blob = await fileResponse.blob();
- * saveAs(blob, 'video.mp4');
- * ```
- * 
- * SECURITY:
- * ✅ Client downloads directly from S3 (fast, no bandwidth cost for you)
- * ✅ Client never sees AWS credentials
- * ✅ URL auto-expires (time-limited access)
- * ⚠️  Authentication only at URL generation (not during download)
- * ⚠️  URL can be shared with others (breaks access control)
- * ⚠️  Cannot revoke URL before expiration
- * ⚠️  Bypasses API Gateway rate limiting
- * 
- * ═══════════════════════════════════════════════════════════════════════════════
- * PARALLEL DOWNLOAD MECHANICS
- * ═══════════════════════════════════════════════════════════════════════════════
- * 
- * Both approaches support parallel chunk downloads:
- * 
- * 1. Split large file into chunks (e.g., 500 MB → 50 chunks of 10 MB each)
- * 2. Download multiple chunks simultaneously (e.g., 10 at once)
- * 3. Write each chunk to correct position in output file
- * 4. Assemble into complete file
- * 
- * SPEED IMPROVEMENT:
- * ┌─────────────────────┬──────────────┬────────────────┐
- * │ Method              │ Speed        │ Time (1 GB)    │
- * ├─────────────────────┼──────────────┼────────────────┤
- * │ Sequential (1 conn) │ 20 MB/s      │ 50 seconds     │
- * │ Parallel (10 conn)  │ 125 MB/s     │ 8 seconds      │
- * └─────────────────────┴──────────────┴────────────────┘
- * 
- * WHY IT'S FASTER:
- * - Single connection: Limited by TCP slow-start, congestion control
- * - Multiple connections: Each operates independently, aggregate is higher
- * - S3 distributes requests across servers for higher throughput
- * 
- * ═══════════════════════════════════════════════════════════════════════════════
- * USAGE
- * ═══════════════════════════════════════════════════════════════════════════════
- * 
- * COMMAND LINE:
- * java S3DownloadDemo <bucket> <key> <output-file> [method]
- * 
- * EXAMPLES:
- * # Using presigned URL (default)
- * java S3DownloadDemo my-bucket videos/demo.mp4 output.mp4 presigned
- * 
- * # Using SDK direct
- * java S3DownloadDemo my-bucket videos/demo.mp4 output.mp4 sdk
- * 
- * # Using default method (presigned)
- * java S3DownloadDemo my-bucket videos/demo.mp4 output.mp4
- * 
- * ═══════════════════════════════════════════════════════════════════════════════
- * WHICH APPROACH TO USE?
- * ═══════════════════════════════════════════════════════════════════════════════
- * 
- * USE SDK DIRECT WHEN:
- * ✅ Downloading sensitive/regulated data (PII, PHI, financial)
- * ✅ Need strong audit trail for compliance
- * ✅ Need real-time access control (immediate revocation)
- * ✅ Want to prevent URL sharing
- * ✅ Need rate limiting on downloads
- * ✅ Files are small-to-medium (<100 MB)
- * 
- * USE PRESIGNED URL WHEN:
- * ✅ Files are public or low-sensitivity
- * ✅ Very large files (>1 GB) where proxying is impractical
- * ✅ High download volume (reduce server bandwidth costs)
- * ✅ Want maximum download speed for clients
- * ✅ Accept security trade-offs (URL sharing, delayed revocation)
- * 
- * REQUIREMENTS:
- * - Java 17 or higher
- * - AWS SDK 2.x (2.21.42+)
- * - AWS credentials configured (env vars, credentials file, or IAM role)
- * - Network access to S3
- * 
- * @author AWS Solutions Team
- * @version 3.0
- * @since 2024-11-21
- */
-public class S3DownloadDemo {
-    
-    /*
-     * ═══════════════════════════════════════════════════════════════════════════
-     * CLASS CONSTANTS - Values that never change during program execution
-     * ═══════════════════════════════════════════════════════════════════════════
-     */
-    
-    /**
-     * Size of buffer for reading/writing data.
-     * 
-     * WHAT IT DOES:
-     * When downloading, we don't read byte-by-byte (too slow).
-     * Instead, we read BUFFER_SIZE bytes at a time.
-     * 
-     * WHY 16 KB (16384 bytes)?
-     * - Too small (1 KB): Too many system calls → CPU overhead
-     * - Too large (1 MB): Uses too much memory, may cause GC pauses
-     * - 16 KB: Optimal balance for most systems
-     * - Matches typical OS page size and network MTU
-     * 
-     * MEMORY IMPACT:
-     * - Each download thread uses one buffer
-     * - 10 threads × 16 KB = 160 KB total (negligible)
-     */
-    private static final int BUFFER_SIZE = 16384; // 16 KB = 16 * 1024 bytes
-    
-    /**
-     * Download method enum - determines which approach to use
-     */
-    public enum DownloadMethod {
-        SDK_DIRECT,      // Use AWS SDK directly (proxied through your server)
-        PRESIGNED_URL    // Use presigned URLs (client downloads directly from S3)
-    }
-    
-    /*
-     * ═══════════════════════════════════════════════════════════════════════════
-     * MAIN METHOD - Program entry point (where execution begins)
-     * ═══════════════════════════════════════════════════════════════════════════
-     */
-    
-    /**
-     * Main method - orchestrates the entire download process.
-     * 
-     * EXECUTION FLOW:
-     * ┌─────────────────────────────────────────────────────────────┐
-     * │ 1. Parse arguments (bucket, key, output, method)            │
-     * │ 2. Initialize AWS clients (S3Client, S3Presigner)           │
-     * │ 3. Get file metadata (size, type, etag)                     │
-     * │ 4. Calculate strategy (thread count, chunk size)            │
-     * │ 5. Choose download method (SDK or Presigned URL)            │
-     * │ 6. Pre-allocate output file (improves performance)          │
-     * │ 7. Download chunks in parallel                              │
-     * │ 8. Wait for all chunks to complete                          │
-     * │ 9. Display statistics (speed, duration)                     │
-     * └─────────────────────────────────────────────────────────────┘
-     * 
-     * @param args Command-line arguments: [bucket, key, output-file, method]
-     *             args[0] = S3 bucket name (e.g., "my-bucket")
-     *             args[1] = S3 object key (e.g., "videos/demo.mp4")
-     *             args[2] = Output filename (e.g., "output.mp4")
-     *             args[3] = Method: "sdk" or "presigned" (optional, defaults to "presigned")
-     */
-    public static void main(String[] args) {
-        
-        /*
-         * ═══════════════════════════════════════════════════════════════════════
-         * STEP 1: VALIDATE COMMAND-LINE ARGUMENTS
-         * ═══════════════════════════════════════════════════════════════════════
-         * Check if user provided correct number of arguments.
-         * If not, print usage instructions and exit.
-         */
-        
-        // Check if args array has fewer than 3 elements
-        if (args.length < 3) {
-            // Print error message to standard error stream (stderr)
-            // stderr is used for errors so they don't mix with normal output
-            System.err.println("Usage: java S3DownloadDemo <bucket> <key> <output-file> [method]");
-            System.err.println("Example: java S3DownloadDemo my-bucket videos/demo.mp4 demo.mp4 sdk");
-            System.err.println("         java S3DownloadDemo my-bucket videos/demo.mp4 demo.mp4 presigned");
-            System.err.println("Methods: sdk | presigned (default: presigned)");
-            
-            // Exit program with status code 1 (non-zero = error)
-            // Status codes: 0 = success, 1-255 = various errors
-            System.exit(1);
-        }
-        
-        /*
-         * ═══════════════════════════════════════════════════════════════════════
-         * STEP 2: EXTRACT COMMAND-LINE ARGUMENTS INTO VARIABLES
-         * ═══════════════════════════════════════════════════════════════════════
-         * Store arguments in descriptive variable names for clarity.
-         */
-        
-        // Extract bucket name from first argument
-        // Example: If user typed "my-bucket", this stores "my-bucket"
-        String bucket = args[0];
-        
-        // Extract S3 object key from second argument
-        // Key can be just filename ("demo.mp4") or path ("videos/2024/demo.mp4")
-        // S3 doesn't have real folders - the "/" is just part of the key name
-        String key = args[1];
-        
-        // Extract output filename from third argument
-        // This is where downloaded file will be saved on local disk
-        String outputFile = args[2];
-        
-        // Determine download method (SDK or Presigned URL)
-        // Default to PRESIGNED_URL if not specified
-        DownloadMethod method = DownloadMethod.PRESIGNED_URL;
-        if (args.length >= 4) {
-            String methodArg = args[3].toLowerCase();
-            if ("sdk".equals(methodArg)) {
-                method = DownloadMethod.SDK_DIRECT;
-            } else if ("presigned".equals(methodArg)) {
-                method = DownloadMethod.PRESIGNED_URL;
-            } else {
-                System.err.println("Invalid method: " + methodArg);
-                System.err.println("Valid methods: sdk | presigned");
-                System.exit(1);
-            }
-        }
-        
-        /*
-         * ═══════════════════════════════════════════════════════════════════════
-         * STEP 3: TRY-CATCH BLOCK FOR ERROR HANDLING
-         * ═══════════════════════════════════════════════════════════════════════
-         * Wrap all download logic in try-catch to handle errors gracefully.
-         * Without this, program would crash on any error.
-         */
+    static {
         try {
-            
-            /*
-             * ───────────────────────────────────────────────────────────────────
-             * Print welcome message
-             * ───────────────────────────────────────────────────────────────────
-             */
-            
-            // \n creates a blank line for better readability
-            System.out.println("\n🚀 Ultra-Fast S3 Downloader");
-            System.out.printf("📋 Method: %s%n%n", 
-                method == DownloadMethod.SDK_DIRECT ? "SDK Direct (Proxied)" : "Presigned URL (Direct S3)");
-            
-            /*
-             * ───────────────────────────────────────────────────────────────────
-             * Start timing the download
-             * ───────────────────────────────────────────────────────────────────
-             */
-            
-            // Instant.now() captures current time with nanosecond precision
-            // We'll use this later to calculate total download duration
-            Instant start = Instant.now();
-            
-            /*
-             * ═══════════════════════════════════════════════════════════════════
-             * STEP 4: INITIALIZE AWS S3 CLIENT
-             * ═══════════════════════════════════════════════════════════════════
-             * Create client to interact with S3 API.
-             */
-            
-            // S3Client.builder() starts building a client with configuration
-            S3Client s3 = S3Client.builder()
-                    // Set AWS region (must match where your bucket is located)
-                    // Region.US_EAST_1 = Northern Virginia data center
-                    .region(Region.US_EAST_1)
-                    // DefaultCredentialsProvider automatically finds credentials from:
-                    // 1. Environment variables (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY)
-                    // 2. ~/.aws/credentials file
-                    // 3. EC2 instance role (if running on AWS)
-                    .credentialsProvider(DefaultCredentialsProvider.create())
-                    // .build() finalizes configuration and creates the client object
-                    .build();
-            
-            /*
-             * ═══════════════════════════════════════════════════════════════════
-             * STEP 5: INITIALIZE S3 PRESIGNER (only if using presigned URL method)
-             * ═══════════════════════════════════════════════════════════════════
-             * Create presigner to generate temporary download URLs.
-             */
-            
-            // S3Presigner generates URLs with embedded signatures
-            // These URLs allow temporary access without AWS credentials
-            // Only needed for presigned URL approach
-            S3Presigner presigner = null;
-            if (method == DownloadMethod.PRESIGNED_URL) {
-                presigner = S3Presigner.builder()
-                        // Must use same region as S3Client
-                        .region(Region.US_EAST_1)
-                        // Use same credentials as S3Client
-                        .credentialsProvider(DefaultCredentialsProvider.create())
-                        // Build the presigner
-                        .build();
-            }
-            
-            /*
-             * ═══════════════════════════════════════════════════════════════════
-             * STEP 6: GET FILE METADATA FROM S3 (HeadObject API call)
-             * ═══════════════════════════════════════════════════════════════════
-             * Before downloading, we need to know:
-             * - Does the file exist?
-             * - How big is it?
-             * - What type is it?
-             */
-            
-            // HeadObjectRequest.builder() creates a request object
-            HeadObjectResponse metadata = s3.headObject(
-                HeadObjectRequest.builder()
-                    // Specify which bucket contains the object
-                    .bucket(bucket)
-                    // Specify which object (by key/path)
-                    .key(key)
-                    // Finalize the request configuration
-                    .build()
-            );
-            // s3.headObject() makes HTTP HEAD request to S3
-            // This gets metadata WITHOUT downloading the file (fast and cheap)
-            // Returns: HeadObjectResponse containing size, type, etag, last-modified, etc.
-            
-            /*
-             * ───────────────────────────────────────────────────────────────────
-             * Extract file size from metadata response
-             * ───────────────────────────────────────────────────────────────────
-             */
-            
-            // metadata.contentLength() returns file size in bytes
-            // Example: 524288000 bytes = 500 MB
-            long fileSize = metadata.contentLength();
-            
-            /*
-             * ───────────────────────────────────────────────────────────────────
-             * Print file information to console
-             * ───────────────────────────────────────────────────────────────────
-             */
-            
-            // %s = placeholder for string (key variable)
-            // %n = platform-specific newline (works on Windows, Linux, Mac)
-            System.out.printf("📄 File: %s%n", key);
-            
-            // formatBytes() converts bytes to human-readable format
-            // Example: 524288000 → "500.0 MB"
-            System.out.printf("📦 Size: %s%n%n", formatBytes(fileSize));
-            
-            /*
-             * ═══════════════════════════════════════════════════════════════════
-             * STEP 7: CALCULATE OPTIMAL DOWNLOAD STRATEGY
-             * ═══════════════════════════════════════════════════════════════════
-             * Determine how many threads to use and how big each chunk should be.
-             */
-            
-            // Calculate optimal thread count based on file size
-            // Small files: fewer threads (less overhead)
-            // Large files: more threads (maximize parallelism)
-            int threads = calculateThreads(fileSize);
-            
-            // Calculate optimal chunk size
-            // Each thread downloads one chunk at a time
-            // Too small: too many chunks, more overhead
-            // Too large: less parallelism, memory issues
-            long chunkSize = calculateChunkSize(fileSize);
-            
-            // Calculate total number of chunks
-            // Math.ceil() rounds up (e.g., 10.1 → 11)
-            // Cast to int because we need whole number of chunks
-            // Example: 500 MB file / 10 MB chunks = 50 chunks
-            int totalChunks = (int) Math.ceil((double) fileSize / chunkSize);
-            
-            /*
-             * ───────────────────────────────────────────────────────────────────
-             * Print download strategy to console
-             * ───────────────────────────────────────────────────────────────────
-             */
-            
-            // %d = placeholder for integer (threads, totalChunks)
-            System.out.printf("⚙️  Strategy: %d threads × %s chunks = %d parts%n%n", 
-                    threads, formatBytes(chunkSize), totalChunks);
-            
-            /*
-             * ═══════════════════════════════════════════════════════════════════
-             * STEP 8: PREPARE DOWNLOAD URL/CONNECTION
-             * ═══════════════════════════════════════════════════════════════════
-             * For presigned URL: Generate temporary URL
-             * For SDK: We'll use S3Client directly (no URL needed)
-             */
-            
-            String url = null;
-            
-            if (method == DownloadMethod.PRESIGNED_URL) {
-                // GetObjectPresignRequest configures the presigned URL generation
-                GetObjectPresignRequest presignRequest = GetObjectPresignRequest.builder()
-                        // URL will expire after 1 hour
-                        // After expiration, URL returns 403 Forbidden error
-                        .signatureDuration(Duration.ofHours(1))
-                        // Specify what we want to presign (a GetObject request)
-                        .getObjectRequest(GetObjectRequest.builder()
-                                .bucket(bucket)  // Which bucket
-                                .key(key)        // Which object
-                                .build())
-                        .build();
-                
-                // presigner.presignGetObject() generates the URL
-                // Returns PresignedGetObjectRequest containing the URL and metadata
-                // .url() extracts the URL
-                // .toString() converts URL object to String
-                url = presigner.presignGetObject(presignRequest).url().toString();
-                
-                // WHAT THIS URL LOOKS LIKE:
-                // https://my-bucket.s3.amazonaws.com/videos/demo.mp4
-                //   ?X-Amz-Algorithm=AWS4-HMAC-SHA256
-                //   &X-Amz-Credential=AKIAIOSFODNN7EXAMPLE/20241121/us-east-1/s3/aws4_request
-                //   &X-Amz-Date=20241121T120000Z
-                //   &X-Amz-Expires=3600
-                //   &X-Amz-SignedHeaders=host
-                //   &X-Amz-Signature=abc123def456...
-            }
-            // For SDK method, we don't need a URL - we'll use S3Client directly
-            
-            /*
-             * ═══════════════════════════════════════════════════════════════════
-             * STEP 9: PREPARE OUTPUT FILE
-             * ═══════════════════════════════════════════════════════════════════
-             * Create output file and pre-allocate space for better performance.
-             */
-            
-            // Path.of() converts string to Path object (modern file API)
-            // Example: "output.mp4" → Path object representing that file
-            Path outputPath = Path.of(outputFile);
-            
-            // Convert to absolute path (full path from root)
-            // Example: "output.mp4" → "/home/user/output.mp4"
-            // WHY: Prevents NullPointerException when getting parent directory
-            outputPath = outputPath.toAbsolutePath();
-            
-            // Get parent directory of output file
-            // Example: "/home/user/downloads/output.mp4" → "/home/user/downloads"
-            // If outputPath has no parent (shouldn't happen with absolute path), returns null
-            Path parentDir = outputPath.getParent();
-            
-            // Check if parent directory is not null before creating directories
-            if (parentDir != null) {
-                // Files.createDirectories() creates all parent directories if they don't exist
-                // Example: If "downloads/2024/november/" doesn't exist, creates all of it
-                // Different from createDirectory() which only creates one level
-                Files.createDirectories(parentDir);
-            }
-            
-            // Pre-allocate file space for better performance
-            // try-with-resources: automatically closes RandomAccessFile when done
-            try (RandomAccessFile raf = new RandomAccessFile(outputPath.toFile(), "rw")) {
-                // "rw" = read-write mode
-                // outputPath.toFile() converts Path to old File object (required by RandomAccessFile)
-                
-                // setLength() allocates disk space without writing data
-                // WHY THIS HELPS:
-                // 1. Prevents file fragmentation (better disk performance)
-                // 2. Ensures disk has enough space before downloading
-                // 3. Allows parallel writes without file growing dynamically
-                raf.setLength(fileSize);
-            }
-            // RandomAccessFile automatically closed here (try-with-resources)
-            
-            /*
-             * ═══════════════════════════════════════════════════════════════════
-             * STEP 10: SET UP PARALLEL DOWNLOAD EXECUTION
-             * ═══════════════════════════════════════════════════════════════════
-             * Create thread pool and prepare for parallel downloads.
-             */
-            
-            // Create thread pool with fixed number of threads
-            // ExecutorService manages threads for us (no manual Thread.start())
-            // Executors.newFixedThreadPool(threads) creates pool of 'threads' workers
-            // Example: threads=10 means max 10 chunks downloaded simultaneously
-            ExecutorService executor = Executors.newFixedThreadPool(threads);
-            
-            // AtomicLong: thread-safe counter for tracking total bytes downloaded
-            // WHY ATOMIC: Multiple threads will increment this counter simultaneously
-            // Regular long would have race conditions (lost updates)
-            // AtomicLong uses CPU-level atomic operations (lock-free, fast)
-            // Initial value: 0 bytes downloaded
-            AtomicLong downloaded = new AtomicLong(0);
-            
-            // List to store Future objects
-            // Future represents result of async computation (will complete later)
-            // Each Future<Boolean> represents one chunk download
-            // Boolean: true=success, false=failure
-            List<Future<Boolean>> futures = new ArrayList<>();
-            
-            /*
-             * ───────────────────────────────────────────────────────────────────
-             * Print progress header
-             * ───────────────────────────────────────────────────────────────────
-             */
-            System.out.println("⬇️  Downloading...\n");
-            
-            /*
-             * ═══════════════════════════════════════════════════════════════════
-             * STEP 11: SCHEDULE CHUNK DOWNLOADS
-             * ═══════════════════════════════════════════════════════════════════
-             * Create download tasks for each chunk and submit to thread pool.
-             */
-            
-            // Loop through each chunk
-            // i = chunk index (0, 1, 2, ..., totalChunks-1)
-            for (int i = 0; i < totalChunks; i++) {
-                
-                // Calculate byte range for this chunk
-                // Cast to long to prevent integer overflow for large files
-                // Example: Chunk 0: startByte = 0
-                //          Chunk 1: startByte = chunkSize
-                //          Chunk 2: startByte = 2 * chunkSize
-                final long startByte = (long) i * chunkSize;
-                
-                // Calculate end byte (inclusive)
-                // Math.min ensures last chunk doesn't exceed file size
-                // Example: File 105 MB, chunkSize 10 MB
-                //          Chunk 10: startByte=100MB, endByte=104MB (not 110MB)
-                // Subtract 1 because byte ranges are inclusive on both ends
-                // "bytes=0-9" means first 10 bytes (0,1,2,3,4,5,6,7,8,9)
-                final long endByte = Math.min(startByte + chunkSize - 1, fileSize - 1);
-                
-                // Submit download task to thread pool
-                // executor.submit() returns Future<Boolean>
-                // () -> downloadChunk(...) is a lambda (anonymous function)
-                // Lambda creates a Callable that returns boolean
-                Future<Boolean> future;
-                
-                if (method == DownloadMethod.PRESIGNED_URL) {
-                    // Use presigned URL method (HTTP Range requests)
-                    future = executor.submit(() -> 
-                        downloadChunkViaPresignedURL(url, outputPath, startByte, endByte, downloaded, fileSize)
-                    );
-                } else {
-                    // Use SDK direct method (AWS SDK GetObject with Range)
-                    future = executor.submit(() -> 
-                        downloadChunkViaSDK(s3, bucket, key, outputPath, startByte, endByte, downloaded, fileSize)
-                    );
-                }
-                
-                // Add future to list so we can wait for completion later
-                futures.add(future);
-            }
-            // At this point, all chunks are scheduled but may not have completed yet
-            // Thread pool is actively downloading chunks in parallel
-            
-            /*
-             * ═══════════════════════════════════════════════════════════════════
-             * STEP 12: WAIT FOR ALL CHUNKS TO COMPLETE
-             * ═══════════════════════════════════════════════════════════════════
-             * Block until all download tasks finish.
-             */
-            
-            // Iterate through all futures
-            for (Future<Boolean> future : futures) {
-                // future.get() blocks until this chunk completes
-                // Returns boolean (true=success, false=failure)
-                // Throws exception if chunk download threw exception
-                future.get();
-                
-                // After each chunk completes, update progress display
-                // downloaded.get() returns current total of downloaded bytes
-                printProgress(downloaded.get(), fileSize);
-            }
-            // When we reach here, ALL chunks have completed successfully
-            
-            /*
-             * ───────────────────────────────────────────────────────────────────
-             * Shutdown thread pool
-             * ───────────────────────────────────────────────────────────────────
-             */
-            
-            // executor.shutdown() initiates orderly shutdown
-            // No new tasks accepted, but existing tasks continue
-            // Threads terminate when all tasks complete
-            executor.shutdown();
-            
-            /*
-             * ═══════════════════════════════════════════════════════════════════
-             * STEP 13: CALCULATE AND DISPLAY STATISTICS
-             * ═══════════════════════════════════════════════════════════════════
-             * Show download performance metrics.
-             */
-            
-            // Calculate total duration
-            // Duration.between(start, end) calculates time span
-            // .toMillis() converts to milliseconds
-            long durationMs = Duration.between(start, Instant.now()).toMillis();
-            
-            // Calculate average download speed in MB/s
-            // fileSize / 1024.0 / 1024.0 converts bytes to megabytes
-            // durationMs / 1000.0 converts milliseconds to seconds
-            // Result: megabytes per second
-            double speedMBps = (fileSize / 1024.0 / 1024.0) / (durationMs / 1000.0);
-            
-            // Print completion summary
-            // Two \n creates blank lines for readability
-            System.out.printf("\n\n✅ Download complete!%n");
-            System.out.printf("   ├─ File: %s%n", outputFile);
-            System.out.printf("   ├─ Size: %s%n", formatBytes(fileSize));
-            System.out.printf("   ├─ Time: %.1fs%n", durationMs / 1000.0);
-            System.out.printf("   └─ Speed: %.2f MB/s%n%n", speedMBps);
-            
-        } catch (Exception e) {
-            // If ANY error occurred anywhere in try block, execution jumps here
-            
-            // Print error message
-            System.err.println("\n❌ Download failed: " + e.getMessage());
-            
-            // Print full stack trace (detailed error information)
-            // Shows exactly where error occurred and call chain
-            e.printStackTrace();
-            
-            // Exit with error status
-            System.exit(1);
+            SHA256 = MessageDigest.getInstance("SHA-256");
+        } catch (NoSuchAlgorithmException e) {
+            throw new ExceptionInInitializerError("SHA-256 not available");
         }
     }
-    
-    /*
-     * ═══════════════════════════════════════════════════════════════════════════
-     * REST ENDPOINT IMPLEMENTATION EXAMPLES
-     * ═══════════════════════════════════════════════════════════════════════════
-     * 
-     * APPROACH 1: SDK DIRECT - STREAMING DOWNLOAD ENDPOINT
-     * 
-     * This endpoint downloads from S3 and streams to client in real-time.
-     * The file DOES reach the client - server acts as proxy.
-     * 
-     * ```java
-     * @RestController
-     * @RequestMapping("/api")
-     * public class DownloadController {
-     *     
-     *     private final S3Client s3;
-     *     
-     *     public DownloadController() {
-     *         this.s3 = S3Client.builder()
-     *             .region(Region.US_EAST_1)
-     *             .credentialsProvider(DefaultCredentialsProvider.create())
-     *             .build();
-     *     }
-     *     
-     *     // SDK DIRECT APPROACH - Server proxies download
-     *     @GetMapping("/download-sdk/{bucket}/{key}")
-     *     public ResponseEntity<StreamingResponseBody> downloadViaSdk(
-     *             @PathVariable String bucket,
-     *             @PathVariable String key,
-     *             @RequestHeader("Authorization") String token) {
-     *         
-     *         // 1. Authenticate user
-     *         if (!validateToken(token)) {
-     *             return ResponseEntity.status(401).build();
-     *         }
-     *         
-     *         // 2. Check permissions
-     *         if (!canUserAccessFile(getUserFromToken(token), key)) {
-     *             return ResponseEntity.status(403).build();
-     *         }
-     *         
-     *         // 3. Get file metadata
-     *         HeadObjectResponse metadata = s3.headObject(
-     *             HeadObjectRequest.builder()
-     *                 .bucket(bucket)
-     *                 .key(key)
-     *                 .build()
-     *         );
-     *         
-     *         // 4. Stream file to client
-     *         StreamingResponseBody stream = outputStream -> {
-     *             long fileSize = metadata.contentLength();
-     *             long chunkSize = 10 * 1024 * 1024; // 10 MB chunks
-     *             
-     *             // Download in chunks
-     *             for (long offset = 0; offset < fileSize; offset += chunkSize) {
-     *                 long endByte = Math.min(offset + chunkSize - 1, fileSize - 1);
-     *                 
-     *                 // Download chunk from S3
-     *                 GetObjectRequest request = GetObjectRequest.builder()
-     *                     .bucket(bucket)
-     *                     .key(key)
-     *                     .range(String.format("bytes=%d-%d", offset, endByte))
-     *                     .build();
-     *                 
-     *                 ResponseInputStream<GetObjectResponse> s3Response = 
-     *                     s3.getObject(request);
-     *                 
-     *                 // Stream chunk to client
-     *                 byte[] buffer = new byte[16384];
-     *                 int bytesRead;
-     *                 while ((bytesRead = s3Response.read(buffer)) != -1) {
-     *                     outputStream.write(buffer, 0, bytesRead);  // ← To client!
-     *                 }
-     *                 
-     *                 s3Response.close();
-     *             }
-     *         };
-     *         
-     *         return ResponseEntity.ok()
-     *             .contentType(MediaType.APPLICATION_OCTET_STREAM)
-     *             .header("Content-Disposition", 
-     *                 "attachment; filename=\"" + key + "\"")
-     *             .contentLength(metadata.contentLength())
-     *             .body(stream);
-     *     }
-     * }
-     * ```
-     * 
-     * CLIENT CODE (SDK DIRECT):
-     * ```javascript
-     * // JavaScript client
-     * async function downloadFile() {
-     *     const response = await fetch('/api/download-sdk/my-bucket/video.mp4', {
-     *         headers: {
-     *             'Authorization': 'Bearer ' + token
-     *         }
-     *     });
-     *     
-     *     // File is being streamed from server
-     *     const blob = await response.blob();
-     *     
-     *     // Save to disk
-     *     const url = window.URL.createObjectURL(blob);
-     *     const a = document.createElement('a');
-     *     a.href = url;
-     *     a.download = 'video.mp4';
-     *     a.click();
-     *     
-     *     // File is now on client's computer! ✅
-     * }
-     * ```
-     * 
-     * APPROACH 2: PRESIGNED URL - TWO-STEP PROCESS
-     * 
-     * Step 1: Generate URL endpoint
-     * Step 2: Client downloads directly from S3
-     * 
-     * ```java
-     * @RestController
-     * @RequestMapping("/api")
-     * public class DownloadController {
-     *     
-     *     private final S3Presigner presigner;
-     *     
-     *     public DownloadController() {
-     *         this.presigner = S3Presigner.builder()
-     *             .region(Region.US_EAST_1)
-     *             .credentialsProvider(DefaultCredentialsProvider.create())
-     *             .build();
-     *     }
-     *     
-     *     // PRESIGNED URL APPROACH - Client downloads directly
-     *     @PostMapping("/generate-download-url")
-     *     public ResponseEntity<DownloadUrlResponse> generateDownloadUrl(
-     *             @RequestBody DownloadUrlRequest request,
-     *             @RequestHeader("Authorization") String token) {
-     *         
-     *         // 1. Authenticate user
-     *         if (!validateToken(token)) {
-     *             return ResponseEntity.status(401).build();
-     *         }
-     *         
-     *         // 2. Check permissions
-     *         String userId = getUserFromToken(token);
-     *         if (!canUserAccessFile(userId, request.getKey())) {
-     *             return ResponseEntity.status(403).build();
-     *         }
-     *         
-     *         // 3. Audit log
-     *         auditLog.info("User {} requested download URL for {}", 
-     *             userId, request.getKey());
-     *         
-     *         // 4. Generate presigned URL (short expiration for security)
-     *         GetObjectPresignRequest presignRequest = 
-     *             GetObjectPresignRequest.builder()
-     *                 .signatureDuration(Duration.ofMinutes(5))  // 5 min expiration
-     *                 .getObjectRequest(GetObjectRequest.builder()
-     *                     .bucket(request.getBucket())
-     *                     .key(request.getKey())
-     *                     .build())
-     *                 .build();
-     *         
-     *         String url = presigner.presignGetObject(presignRequest)
-     *             .url().toString();
-     *         
-     *         // 5. Return URL to client
-     *         return ResponseEntity.ok(new DownloadUrlResponse(
-     *             url,
-     *             Instant.now().plus(Duration.ofMinutes(5)).toString(),
-     *             request.getKey()
-     *         ));
-     *     }
-     * }
-     * 
-     * record DownloadUrlRequest(String bucket, String key) {}
-     * record DownloadUrlResponse(String url, String expiresAt, String fileName) {}
-     * ```
-     * 
-     * CLIENT CODE (PRESIGNED URL):
-     * ```javascript
-     * // JavaScript client
-     * async function downloadFile() {
-     *     // Step 1: Get presigned URL from YOUR server
-     *     const urlResponse = await fetch('/api/generate-download-url', {
-     *         method: 'POST',
-     *         headers: {
-     *             'Authorization': 'Bearer ' + token,
-     *             'Content-Type': 'application/json'
-     *         },
-     *         body: JSON.stringify({
-     *             bucket: 'my-bucket',
-     *             key: 'video.mp4'
-     *         })
-     *     });
-     *     
-     *     const { url, fileName } = await urlResponse.json();
-     *     
-     *     // Step 2: Download DIRECTLY from S3 (bypasses your server)
-     *     const fileResponse = await fetch(url);  // No auth needed!
-     *     const blob = await fileResponse.blob();
-     *     
-     *     // Save to disk
-     *     const downloadUrl = window.URL.createObjectURL(blob);
-     *     const a = document.createElement('a');
-     *     a.href = downloadUrl;
-     *     a.download = fileName;
-     *     a.click();
-     *     
-     *     // File is now on client's computer! ✅
-     * }
-     * ```
-     * 
-     * KEY DIFFERENCES:
-     * 
-     * SDK DIRECT:
-     * - Client → Your API → S3 → Your API → Client
-     * - Every byte passes through your server
-     * - Full authentication on every request
-     * - Rate limiting applies
-     * - Complete audit trail
-     * - Higher server costs (bandwidth)
-     * 
-     * PRESIGNED URL:
-     * - Client → Your API (get URL)
-     * - Client → S3 (download file)
-     * - Bytes go directly from S3 to client
-     * - Authentication only when generating URL
-     * - No rate limiting on download
-     * - Partial audit trail
-     * - Lower server costs (no bandwidth)
-     * 
-     * ANSWERING YOUR QUESTION:
-     * "Will file be downloaded on client end?"
-     * 
-     * YES! In BOTH approaches, the file ends up on the client's computer.
-     * 
-     * SDK DIRECT: File is downloaded to client, but PROXIED through your server
-     * PRESIGNED URL: File is downloaded to client DIRECTLY from S3
-     * 
-     * The difference is WHERE the data comes from:
-     * - SDK Direct: Data flows through your infrastructure
-     * - Presigned URL: Data bypasses your infrastructure
-     */
-    
-    /*
-     * ═══════════════════════════════════════════════════════════════════════════
-     * HELPER METHODS - Utility functions used by main method
-     * ═══════════════════════════════════════════════════════════════════════════
-     */
-    
+
     /**
-     * Downloads a single chunk using PRESIGNED URL approach (HTTP Range request).
-     * 
-     * HOW IT WORKS:
-     * 1. Create HTTP connection to presigned URL
-     * 2. Set Range header (e.g., "bytes=0-10485759" for first 10 MB)
-     * 3. Download chunk data from network into memory buffer
-     * 4. Write buffer to correct position in output file
-     * 5. Update global counter of downloaded bytes
-     * 
-     * DATA FLOW:
-     * S3 → HTTP (presigned URL) → Memory Buffer → Local File
-     * 
-     * THREAD SAFETY:
-     * - Multiple threads call this method simultaneously
-     * - Each thread downloads different byte range (no overlap)
-     * - RandomAccessFile.seek() sets write position (thread-safe operation)
-     * - AtomicLong.addAndGet() safely increments shared counter
-     * 
-     * @param url Presigned S3 URL (temporary access URL)
-     * @param outputPath Path to output file
-     * @param startByte Starting byte position (inclusive, 0-based)
-     * @param endByte Ending byte position (inclusive)
-     * @param downloaded Shared counter for total bytes downloaded (thread-safe)
-     * @param fileSize Total file size (for progress calculation)
-     * @return true if successful, false if failed
+     * Main endpoint: streams one chunk of a file from S3
+     * Supports parallel calls with different offsets
      */
-    private static boolean downloadChunkViaPresignedURL(
-            String url,           // Presigned URL to download from
-            Path outputPath,      // Where to write downloaded data
-            long startByte,       // Start of byte range to download
-            long endByte,         // End of byte range to download
-            AtomicLong downloaded,// Shared counter (atomic for thread safety)
-            long fileSize         // Total file size (for progress display)
-    ) {
-        try {
-            /*
-             * ───────────────────────────────────────────────────────────────────
-             * STEP 1: Create HTTP connection to presigned URL
-             * ───────────────────────────────────────────────────────────────────
-             */
-            
-            // new URL(url) parses URL string into URL object
-            // .openConnection() creates HTTP connection (not connected yet)
-            // Cast to HttpURLConnection for HTTP-specific methods
-            HttpURLConnection conn = (HttpURLConnection) new URL(url).openConnection();
-            
-            // setRequestMethod("GET") specifies HTTP GET request
-            // GET = retrieve data (vs POST=send data, PUT=upload, DELETE=remove)
-            conn.setRequestMethod("GET");
-            
-            // *** THE MAGIC HAPPENS HERE ***
-            // Range header tells S3 to send only specific byte range
-            // Format: "bytes=start-end" (both inclusive)
-            // Example: "bytes=0-10485759" requests first 10 MB (bytes 0 through 10485759)
-            // S3 responds with HTTP 206 Partial Content (not 200 OK)
-            conn.setRequestProperty("Range", String.format("bytes=%d-%d", startByte, endByte));
-            
-            // Set connection timeout: max 10 seconds to establish connection
-            // If can't connect in 10s, throw SocketTimeoutException
-            conn.setConnectTimeout(10000);
-            
-            // Set read timeout: max 30 seconds of no data received
-            // If no data for 30s, throw SocketTimeoutException
-            conn.setReadTimeout(30000);
-            
-            /*
-             * ───────────────────────────────────────────────────────────────────
-             * STEP 2: Verify HTTP response code
-             * ───────────────────────────────────────────────────────────────────
-             */
-            
-            // getResponseCode() actually sends request and returns HTTP status code
-            // 206 = Partial Content (successful range request)
-            // Other codes:
-            //   200 = OK (but we want 206 for range requests)
-            //   403 = Forbidden (URL expired or no permission)
-            //   404 = Not Found (object doesn't exist)
-            //   416 = Range Not Satisfiable (invalid byte range)
-            if (conn.getResponseCode() != 206) {
-                // Throw exception if didn't get expected 206 status
-                throw new IOException("Expected 206, got " + conn.getResponseCode());
-            }
-            
-            /*
-             * ───────────────────────────────────────────────────────────────────
-             * STEP 3: Download chunk data into memory
-             * ───────────────────────────────────────────────────────────────────
-             */
-            
-            // Create in-memory buffer to store downloaded bytes
-            // ByteArrayOutputStream grows automatically as we write to it
-            // Initial capacity = chunk size (avoids reallocations)
-            ByteArrayOutputStream buffer = new ByteArrayOutputStream((int) (endByte - startByte + 1));
-            
-            // try-with-resources: automatically closes InputStream
-            try (InputStream in = conn.getInputStream()) {
-                // getInputStream() opens stream to read response body
-                
-                // Create fixed-size byte array for reading
-                // We read BUFFER_SIZE bytes at a time (16 KB)
-                byte[] data = new byte[BUFFER_SIZE];
-                
-                // Variable to store how many bytes were read in each iteration
-                int bytesRead;
-                
-                // Read loop: continues until end of stream
-                // in.read(data) reads up to BUFFER_SIZE bytes into 'data' array
-                // Returns number of bytes actually read, or -1 if end of stream
-                while ((bytesRead = in.read(data)) != -1) {
-                    // Write bytesRead bytes from 'data' array to buffer
-                    // buffer now contains downloaded data in memory
-                    buffer.write(data, 0, bytesRead);
-                    
-                    // Update global downloaded counter (thread-safe operation)
-                    // addAndGet() atomically adds bytesRead to current value
-                    // Returns new total value
-                    downloaded.addAndGet(bytesRead);
-                }
-            }
-            // InputStream automatically closed here
-            
-            /*
-             * ───────────────────────────────────────────────────────────────────
-             * STEP 4: Write downloaded data to correct position in file
-             * ───────────────────────────────────────────────────────────────────
-             */
-            
-            // try-with-resources: automatically closes RandomAccessFile
-            try (RandomAccessFile raf = new RandomAccessFile(outputPath.toFile(), "rw")) {
-                // RandomAccessFile allows reading/writing at any position
-                // "rw" = read-write mode
-                
-                // seek() moves file pointer to startByte position
-                // Next write will start at this position
-                // Example: startByte=10485760 writes starting at byte 10485760
-                raf.seek(startByte);
-                
-                // toByteArray() converts buffer to byte array
-                // write() writes entire byte array to file at current position
-                // This writes the chunk to correct location in file
-                raf.write(buffer.toByteArray());
-            }
-            // RandomAccessFile automatically closed here
-            
-            // Return true indicating successful download
-            return true;
-            
-        } catch (Exception e) {
-            // If any error occurred, catch it here
-            
-            // Print error message with chunk byte range
-            // %d = decimal integer placeholder
-            System.err.printf("\n⚠️  Chunk %d-%d failed: %s%n", 
-                    startByte, endByte, e.getMessage());
-            
-            // Return false indicating failure
-            return false;
+    @GetMapping(value = "/{fileId}/download", produces = MediaType.APPLICATION_OCTET_STREAM_VALUE)
+    public ResponseEntity<StreamingResponseBody> downloadChunk(
+            @PathVariable String fileId,                    // Unique file identifier (e.g., UUID)
+            @RequestParam(defaultValue = "0") long offset,  // Byte offset to start reading from
+            @AuthenticationPrincipal Jwt jwt) {             // Authenticated user (Cognito/JWT)
+
+        // Extract user ID from JWT token for audit/access control
+        String userId = jwt.getSubject();
+
+        // Validate user has access + log access attempt (critical for compliance)
+        FileMetadata meta = fileService.validateAndLogAccess(userId, fileId);
+
+        // S3 object key (path inside bucket)
+        String key = meta.s3Key(); // e.g., "encrypted/2025/model-v2.bin"
+
+        // Get total file size via HEAD request (fast, no data transfer)
+        long fileSize = getObjectSize(key);
+
+        // Calculate end byte of this chunk (inclusive)
+        long end = Math.min(offset + CHUNK_SIZE - 1, fileSize - 1);
+
+        // Determine if there's more data after this chunk
+        long nextOffset = end + 1 < fileSize ? end + 1 : -1;
+
+        // Compute SHA-256 checksum of *only this byte range* (for integrity)
+        String partChecksum = computePartChecksum(key, offset, end);
+
+        // Build response headers — client uses these for resume & verification
+        HttpHeaders headers = new HttpHeaders();
+        headers.setContentType(MediaType.APPLICATION_OCTET_STREAM);
+        headers.set("Accept-Ranges", "bytes");                    // Tells client we support ranges
+        headers.set("X-File-Size", String.valueOf(fileSize));     // Total file size in bytes
+        headers.set("X-Full-Checksum", meta.sha256());            // Pre-computed full file SHA-256
+        headers.set("X-Part-Checksum", partChecksum);             // This chunk's SHA-256 (Base64)
+        headers.set("X-Chunk-Start", String.valueOf(offset));    // Start byte of this chunk
+        headers.set("X-Chunk-End", String.valueOf(end));          // End byte of this chunk
+        headers.set("X-Filename", URLEncoder.encode(meta.filename(), UTF_8));
+
+        // Tell client if more chunks exist
+        if (nextOffset > 0) {
+            headers.set("X-Next-Offset", String.valueOf(nextOffset));
+            headers.set("X-Has-More", "true");
+        } else {
+            headers.set("X-Has-More", "false");
         }
-    }
-    
-    /**
-     * Downloads a single chunk using SDK DIRECT approach (AWS SDK GetObject with Range).
-     * 
-     * HOW IT WORKS:
-     * 1. Create GetObjectRequest with Range parameter
-     * 2. Call S3Client.getObject() with range specification
-     * 3. Download chunk data directly from S3 using AWS SDK
-     * 4. Write data to correct position in output file
-     * 5. Update global counter of downloaded bytes
-     * 
-     * DATA FLOW:
-     * S3 → AWS SDK (with credentials) → Memory Buffer → Local File
-     * 
-     * KEY DIFFERENCE FROM PRESIGNED URL:
-     * - Uses AWS credentials directly (not presigned URL)
-     * - Downloads through AWS SDK (not raw HTTP)
-     * - More secure but requires credentials on server
-     * 
-     * REST ENDPOINT CONTEXT:
-     * When used via REST endpoint:
-     * Client → API Gateway → Your Server (this code) → S3
-     *                              ↓
-     *                        Downloads chunk
-     *                              ↓
-     *                        Returns to client
-     * 
-     * The file DOES get downloaded to the client, but it's PROXIED through your server.
-     * Your server acts as an intermediary, downloading from S3 and streaming to client.
-     * 
-     * @param s3 S3Client instance with AWS credentials
-     * @param bucket S3 bucket name
-     * @param key S3 object key
-     * @param outputPath Path to output file
-     * @param startByte Starting byte position (inclusive, 0-based)
-     * @param endByte Ending byte position (inclusive)
-     * @param downloaded Shared counter for total bytes downloaded (thread-safe)
-     * @param fileSize Total file size (for progress calculation)
-     * @return true if successful, false if failed
-     */
-    private static boolean downloadChunkViaSDK(
-            S3Client s3,          // AWS SDK client (has credentials)
-            String bucket,        // Bucket name
-            String key,           // Object key
-            Path outputPath,      // Where to write downloaded data
-            long startByte,       // Start of byte range to download
-            long endByte,         // End of byte range to download
-            AtomicLong downloaded,// Shared counter (atomic for thread safety)
-            long fileSize         // Total file size (for progress display)
-    ) {
-        try {
-            /*
-             * ───────────────────────────────────────────────────────────────────
-             * STEP 1: Create GetObjectRequest with Range parameter
-             * ───────────────────────────────────────────────────────────────────
-             */
-            
-            // Build request to get specific byte range
-            // *** THE MAGIC HAPPENS HERE ***
-            // Range parameter tells S3 to send only specific bytes
-            // Format: "bytes=start-end" (both inclusive)
-            GetObjectRequest request = GetObjectRequest.builder()
+
+        // Streaming body — streams directly from S3 → API Gateway → Client
+        StreamingResponseBody stream = outputStream -> {
+            GetObjectRequest s3Request = GetObjectRequest.builder()
                     .bucket(bucket)
                     .key(key)
-                    // Range specification - same format as HTTP Range header
-                    // Example: "bytes=0-10485759" requests first 10 MB
-                    .range(String.format("bytes=%d-%d", startByte, endByte))
+                    .range("bytes=" + offset + "-" + end)  // S3 Range GET — only downloads this chunk
                     .build();
-            
-            /*
-             * ───────────────────────────────────────────────────────────────────
-             * STEP 2: Download chunk using AWS SDK
-             * ───────────────────────────────────────────────────────────────────
-             */
-            
-            // s3.getObject() makes authenticated request to S3
-            // Returns ResponseInputStream which contains:
-            // 1. The actual data as an InputStream
-            // 2. Response metadata (content-length, etag, etc.)
-            // This is authenticated using AWS credentials from DefaultCredentialsProvider
-            ResponseInputStream<GetObjectResponse> response = s3.getObject(request);
-            
-            /*
-             * ───────────────────────────────────────────────────────────────────
-             * STEP 3: Download chunk data into memory
-             * ───────────────────────────────────────────────────────────────────
-             */
-            
-            // Create in-memory buffer to store downloaded bytes
-            // ByteArrayOutputStream grows automatically as we write to it
-            ByteArrayOutputStream buffer = new ByteArrayOutputStream((int) (endByte - startByte + 1));
-            
-            // Create fixed-size byte array for reading
-            byte[] data = new byte[BUFFER_SIZE];
-            
-            // Variable to store how many bytes were read
-            int bytesRead;
-            
-            // Read loop: continues until end of stream
-            // response.read(data) reads up to BUFFER_SIZE bytes
-            // Returns number of bytes read, or -1 if end of stream
-            while ((bytesRead = response.read(data)) != -1) {
-                // Write read bytes to buffer
-                buffer.write(data, 0, bytesRead);
-                
-                // Update global downloaded counter (thread-safe)
-                downloaded.addAndGet(bytesRead);
+
+            // Stream directly from S3 to HTTP response (zero buffering)
+            try (ResponseInputStream<GetObjectResponse> s3Stream = s3.getObject(s3Request)) {
+                s3Stream.transferTo(outputStream);  // Efficient zero-copy transfer
             }
-            
-            // Close the response stream
-            response.close();
-            
-            /*
-             * ───────────────────────────────────────────────────────────────────
-             * STEP 4: Write downloaded data to correct position in file
-             * ───────────────────────────────────────────────────────────────────
-             */
-            
-            // try-with-resources: automatically closes RandomAccessFile
-            try (RandomAccessFile raf = new RandomAccessFile(outputPath.toFile(), "rw")) {
-                // seek() moves file pointer to startByte position
-                raf.seek(startByte);
-                
-                // Write entire chunk to file at current position
-                raf.write(buffer.toByteArray());
+        };
+
+        // Log successful chunk delivery
+        log.info("Delivering chunk [{}-{}] of {} (size: {} bytes) to user {}", 
+                offset, end, key, (end - offset + 1), userId);
+
+        // Return 206 Partial Content — standard for range requests
+        return ResponseEntity.status(HttpStatus.PARTIAL_CONTENT)
+                .headers(headers)
+                .contentLength(end - offset + 1)
+                .body(stream);
+    }
+
+    // Fast HEAD request to get file size without downloading
+    private long getObjectSize(String key) {
+        return s3.headObject(b -> b.bucket(bucket).key(key)).contentLength();
+    }
+
+    // Compute SHA-256 of a specific byte range in S3 (used for part verification)
+    private String computePartChecksum(String key, long start, long end) {
+        GetObjectRequest req = GetObjectRequest.builder()
+                .bucket(bucket).key(key)
+                .range("bytes=" + start + "-" + end)
+                .build();
+
+        try (ResponseInputStream<GetObjectResponse> stream = s3.getObject(req)) {
+            MessageDigest digest = (MessageDigest) SHA256.clone(); // Thread-safe clone
+            byte[] buffer = new byte[8192];
+            int read;
+            while ((read = stream.read(buffer)) != -1) {
+                digest.update(buffer, 0, read);
             }
-            
-            // Return true indicating successful download
-            return true;
-            
+            return Base64.getEncoder().encodeToString(digest.digest());
         } catch (Exception e) {
-            // If any error occurred, print error message
-            System.err.printf("\n⚠️  Chunk %d-%d failed (SDK): %s%n", 
-                    startByte, endByte, e.getMessage());
-            
-            // Return false indicating failure
-            return false;
+            throw new RuntimeException("Failed to compute part checksum", e);
         }
     }
-    
-    /**
-     * Prints download progress bar to console.
-     * 
-     * FORMAT:
-     * [████████████████████░░░░░░░░░░░░] 65% (650.0 MB/1.0 GB)
-     * 
-     * HOW IT WORKS:
-     * 1. Calculate percentage complete
-     * 2. Create visual progress bar with filled/empty blocks
-     * 3. Format current/total bytes
-     * 4. Print on same line (using \r to overwrite previous line)
-     * 
-     * @param current Bytes downloaded so far
-     * @param total Total file size in bytes
-     */
-    private static void printProgress(long current, long total) {
-        // Calculate percentage (0-100)
-        // Cast to int to remove decimal places
-        // Example: 650 MB / 1 GB = 0.65 * 100 = 65%
-        int percent = (int) ((current * 100) / total);
-        
-        // Calculate number of filled bars
-        // Progress bar is 50 characters wide
-        // percent / 2 converts 0-100% to 0-50 bars
-        // Example: 65% / 2 = 32 bars filled
-        int bars = percent / 2;
-        
-        // Build progress bar string
-        StringBuilder progress = new StringBuilder("[");
-        
-        // Loop 50 times to create 50-character progress bar
-        for (int i = 0; i < 50; i++) {
-            // If i < bars, append filled block (█)
-            // Otherwise append empty block (░)
-            // Example: bars=32 creates "████████████████████████████████░░░░░░░░░░░░░░░░░░"
-            progress.append(i < bars ? "█" : "░");
-        }
-        
-        // Append closing bracket, percentage, and byte counts
-        // %d = integer, %s = string
-        // formatBytes() converts numbers to human-readable (e.g., "650.0 MB")
-        progress.append(String.format("] %d%% (%s/%s)", 
-                percent, formatBytes(current), formatBytes(total)));
-        
-        // Print progress bar
-        // \r = carriage return (moves cursor to beginning of line)
-        // This overwrites previous progress line instead of creating new line
-        // No \n at end so next print also overwrites this line
-        System.out.print("\r" + progress);
+}
+
+
+------------------
+
+public class SecureParallelDownloader {
+
+    private static final long CHUNK_SIZE = 10_485_760L; // Must match server
+    private final HttpClient client;
+    private final String baseUrl;
+    private final String token;
+    private final int threadCount;
+
+    public SecureParallelDownloader(String baseUrl, String token, int threads) {
+        this.baseUrl = baseUrl;
+        this.token = token;
+        this.threadCount = threads;
+        this.client = HttpClient.newBuilder()
+                .executor(Executors.newVirtualThreadPerTaskExecutor()) // JDK 21 = unlimited threads
+                .connectTimeout(Duration.ofSeconds(30))
+                .build();
     }
-    
-    /**
-     * Calculates optimal number of threads based on file size.
-     * 
-     * LOGIC:
-     * - Small files: Fewer threads (overhead would outweigh benefit)
-     * - Large files: More threads (maximize parallelism)
-     * 
-     * REASONING:
-     * - Each thread has overhead (memory, CPU context switching)
-     * - For 1 MB file, 20 threads is overkill (overhead > benefit)
-     * - For 10 GB file, 3 threads is too slow (not utilizing bandwidth)
-     * 
-     * @param fileSize File size in bytes
-     * @return Optimal number of threads (3-30)
-     */
-    private static int calculateThreads(long fileSize) {
-        // If file < 50 MB: use 3 threads
-        if (fileSize < 50 * 1024 * 1024) {
-            return 3;
+
+    public record DownloadStats(long bytes, Duration time, String sha256) {}
+
+    public DownloadStats download(String fileId, Path outputFile) throws Exception {
+        long startTime = System.nanoTime();
+
+        // Step 1: Get file metadata (size + expected full checksum)
+        var meta = fetchMetadata(fileId);
+        long totalSize = meta.size;
+        String expectedFullSha = meta.fullSha;
+
+        // Ensure output directory exists
+        Files.createDirectories(outputFile.getParent());
+
+        // Resume support: track which chunks are already downloaded
+        Path progressFile = outputFile.resolveSibling(outputFile.getFileName() + ".progress");
+        Set<Long> completedChunks = loadCompletedChunks(progressFile);
+
+        // Calculate missing offsets
+        List<Long> missingOffsets = LongStream.range(0, (totalSize + CHUNK_SIZE - 1) / CHUNK_SIZE)
+                .map(i -> i * CHUNK_SIZE)
+                .filter(offset -> !completedChunks.contains(offset))
+                .boxed()
+                .toList();
+
+        // Track total downloaded bytes for progress bar
+        AtomicLong downloadedBytes = new AtomicLong(
+            completedChunks.stream()
+                .mapToLong(offset -> Math.min(offset + CHUNK_SIZE, totalSize) - offset)
+                .sum()
+        );
+
+        // Parallel download with fixed thread pool
+        try (var executor = Executors.newFixedThreadPool(threadCount)) {
+            List<CompletableFuture<Void>> futures = missingOffsets.stream()
+                .map(offset -> CompletableFuture.runAsync(() ->
+                    downloadAndVerifyChunk(fileId, offset, totalSize, outputFile, downloadedBytes, progressFile),
+                    executor))
+                .toList();
+
+            // Live progress bar
+            while (!CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).isDone()) {
+                double percent = 100.0 * downloadedBytes.get() / totalSize;
+                System.out.printf("\r[%-50s] %.2f%% – %s / %s",
+                    "█".repeat((int) (percent / 2)),
+                    percent,
+                    formatBytes(downloadedBytes.get()),
+                    formatBytes(totalSize));
+                Thread.sleep(100);
+            }
         }
-        // If file 50 MB - 500 MB: use 5 threads
-        else if (fileSize < 500 * 1024 * 1024) {
-            return 5;
+
+        System.out.println("\nDownload complete. Verifying integrity...");
+
+        // Final SHA-256 verification of entire file
+        String actualSha = computeFileSha256(outputFile);
+        if (!actualSha.equals(expectedFullSha)) {
+            throw new IOException("CORRUPTION DETECTED: SHA-256 mismatch!");
         }
-        // If file 500 MB - 2 GB: use 10 threads
-        else if (fileSize < 2L * 1024 * 1024 * 1024) {
-            return 10;
-        }
-        // If file 2 GB - 10 GB: use 20 threads
-        else if (fileSize < 10L * 1024 * 1024 * 1024) {
-            return 20;
-        }
-        // If file > 10 GB: use 30 threads
-        else {
-            return 30;
+
+        // Cleanup progress file
+        if (Files.exists(progressFile)) Files.delete(progressFile);
+
+        Duration duration = Duration.ofNanos(System.nanoTime() - startTime);
+        System.out.printf("SUCCESS: %s verified in %s (%s/s)%n",
+                outputFile.getFileName(),
+                formatDuration(duration),
+                formatBytes(totalSize / Math.max(1, duration.toSeconds())) + "/s");
+
+        return new DownloadStats(totalSize, duration, actualSha);
+    }
+
+    private record FileMetadata(long size, String fullSha) {}
+
+    private FileMetadata fetchMetadata(String fileId) throws Exception {
+        var request = HttpRequest.newBuilder()
+                .uri(URI.create(baseUrl + "/api/v1/files/" + fileId + "/download"))
+                .header("Authorization", "Bearer " + token)
+                .method("HEAD", HttpRequest.BodyPublishers.noBody())
+                .build();
+
+        var response = client.send(request, HttpResponse.BodyHandlers.discarding());
+        if (response.statusCode() != 200) throw new IOException("Failed to get metadata");
+
+        long size = Long.parseLong(response.headers().firstValue("x-file-size").orElseThrow());
+        String sha = response.headers().firstValue("x-full-checksum").orElseThrow();
+        return new FileMetadata(size, sha);
+    }
+
+    private void downloadAndVerifyChunk(String fileId, long offset, long totalSize,
+                                        Path outputFile, AtomicLong counter, Path progressFile) {
+        while (true) { // Auto-retry loop
+            try {
+                var request = HttpRequest.newBuilder()
+                        .uri(URI.create(baseUrl + "/api/v1/files/" + fileId + "/download?offset=" + offset))
+                        .header("Authorization", "Bearer " + token)
+                        .timeout(Duration.ofMinutes(10))
+                        .GET()
+                        .build();
+
+                var response = client.send(request, HttpResponse.BodyHandlers.ofByteArray());
+                if (response.statusCode() != 206) {
+                    throw new IOException("Expected 206 Partial Content, got " + response.statusCode());
+                }
+
+                byte[] data = response.body();
+
+                // Verify part checksum before writing
+                String serverChecksum = response.headers().firstValue("x-part-checksum").orElseThrow();
+                String clientChecksum = Base64.getEncoder()
+                        .encodeToString(MessageDigest.getInstance("SHA-256").digest(data));
+
+                if (!serverChecksum.equals(clientChecksum)) {
+                    throw new IOException("Part checksum mismatch at offset " + offset);
+                }
+
+                // Write chunk atomically to correct position
+                try (RandomAccessFile raf = new RandomAccessFile(outputFile.toFile(), "rw")) {
+                    raf.seek(offset);
+                    raf.write(data);
+                }
+
+                // Update progress
+                counter.addAndGet(data.length);
+                appendProgress(progressFile, offset);
+
+                return; // Success — exit retry loop
+
+            } catch (Exception e) {
+                System.err.printf("Chunk %d failed — retrying: %s%n", offset, e.getMessage());
+                try { Thread.sleep(2000); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); }
+            }
         }
     }
-    
-    /**
-     * Calculates optimal chunk size based on file size.
-     * 
-     * LOGIC:
-     * - Small files: Small chunks (faster to start)
-     * - Large files: Large chunks (fewer HTTP requests)
-     * 
-     * TRADE-OFFS:
-     * - Too small: Many chunks = more HTTP overhead
-     * - Too large: Less parallelism, longer retry on failure
-     * 
-     * @param fileSize File size in bytes
-     * @return Optimal chunk size in bytes (5 MB - 50 MB)
-     */
-    private static long calculateChunkSize(long fileSize) {
-        // If file < 50 MB: use 5 MB chunks
-        if (fileSize < 50 * 1024 * 1024) {
-            return 5 * 1024 * 1024;  // 5 MB
-        }
-        // If file 50 MB - 500 MB: use 10 MB chunks
-        else if (fileSize < 500 * 1024 * 1024) {
-            return 10 * 1024 * 1024;  // 10 MB
-        }
-        // If file 500 MB - 2 GB: use 20 MB chunks
-        else if (fileSize < 2L * 1024 * 1024 * 1024) {
-            return 20 * 1024 * 1024;  // 20 MB
-        }
-        // If file > 2 GB: use 50 MB chunks
-        else {
-            return 50 * 1024 * 1024;  // 50 MB
-        }
+
+    private synchronized void appendProgress(Path file, long offset) throws IOException {
+        Files.writeString(file, offset + "\n", StandardOpenOption.CREATE, StandardOpenOption.APPEND);
     }
-    
-    /**
-     * Formats byte count into human-readable string.
-     * 
-     * EXAMPLES:
-     * - 1023 bytes → "1023 B"
-     * - 1024 bytes → "1.0 KB"
-     * - 1048576 bytes → "1.0 MB"
-     * - 1073741824 bytes → "1.0 GB"
-     * 
-     * @param bytes Number of bytes
-     * @return Formatted string (e.g., "1.5 GB")
-     */
-    private static String formatBytes(long bytes) {
-        // If less than 1 KB: show as bytes
-        if (bytes < 1024) {
-            return bytes + " B";
+
+    private Set<Long> loadCompletedChunks(Path file) throws IOException {
+        if (!Files.exists(file)) return new HashSet<>();
+        return Files.lines(file)
+                .map(String::trim)
+                .filter(s -> !s.isEmpty())
+                .map(Long::parseLong)
+                .collect(Collectors.toSet());
+    }
+
+    private String computeFileSha256(Path path) throws Exception {
+        MessageDigest digest = MessageDigest.getInstance("SHA-256");
+        try (InputStream is = Files.newInputStream(path)) {
+            byte[] buffer = new byte[8192];
+            int read;
+            while ((read = is.read(buffer)) != -1) {
+                digest.update(buffer, 0, read);
+            }
         }
-        // If less than 1 MB: show as KB
-        else if (bytes < 1024 * 1024) {
-            // Divide by 1024.0 (not 1024) to get decimal result
-            // %.1f = format as decimal with 1 digit after decimal point
-            return String.format("%.1f KB", bytes / 1024.0);
+        return Base64.getEncoder().encodeToString(digest.digest());
+    }
+
+    private String formatBytes(long bytes) {
+        String[] units = {"B", "KB", "MB", "GB", "TB"};
+        int unit = 0;
+        double size = bytes;
+        while (size >= 1024 && unit < units.length - 1) {
+            size /= 1024.0;
+            unit++;
         }
-        // If less than 1 GB: show as MB
-        else if (bytes < 1024 * 1024 * 1024) {
-            // Divide by 1024 twice to convert bytes → KB → MB
-            return String.format("%.1f MB", bytes / 1024.0 / 1024.0);
-        }
-        // If 1 GB or more: show as GB
-        else {
-            // Divide by 1024 three times to convert bytes → KB → MB → GB
-            return String.format("%.2f GB", bytes / 1024.0 / 1024.0 / 1024.0);
-        }
+        return String.format("%.2f %s", size, units[unit]);
+    }
+
+    private String formatDuration(Duration d) {
+        long s = d.getSeconds();
+        return String.format("%d min %d sec", s / 60, s % 60);
+    }
+
+    // MAIN — Run as standalone Java app
+    public static void main(String[] args) throws Exception {
+        new SecureParallelDownloader(
+                "https://api.yourcompany.com",
+                "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+                32
+        ).download("research-model-v5", Path.of("model-v5.bin"));
     }
 }
